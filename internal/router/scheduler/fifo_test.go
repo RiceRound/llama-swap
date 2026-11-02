@@ -1011,3 +1011,76 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 		t.Fatalf("queue len=%d want 1 after cancel and retry", got)
 	}
 }
+
+func TestFIFO_RejectQuietPeriod(t *testing.T) {
+	f := newFakeEffects()
+	f.states["a"] = process.StateReady
+	f.states["b"] = process.StateStopped
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"b": {"a"}}}, config.FifoConfig{BusyPolicy: "reject"}, nil, f)
+	now := time.Unix(1000, 0)
+	s.now = func() time.Time { return now }
+	rejectB := func() {
+		t.Helper()
+		r := req("b")
+		s.OnRequest(r)
+		err := admitErr(t, r)
+		var busy swaputil.ModelBusyError
+		if !errors.As(err, &busy) || len(s.queued) != 0 || s.reserved["b"] != 0 || f.startsFor("b") != 0 {
+			t.Fatalf("want unqueued rejection; err=%v queued=%d reserved=%v starts=%v", err, len(s.queued), s.reserved, f.starts)
+		}
+	}
+	s.OnRequest(req("a"))
+	s.OnRequest(req("a"))
+	now = now.Add(10 * time.Minute)
+	rejectB() // long-running requests stay protected
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	rejectB() // another handler is still running
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	now = now.Add(299 * time.Second)
+	rejectB()
+	s.OnRequest(req("a")) // same model remains available and resets quiet time
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	now = now.Add(299 * time.Second)
+	rejectB()
+	now = now.Add(time.Second)
+	if f.startsFor("b") != 0 {
+		t.Fatal("must not swap without a fresh request")
+	}
+	r := req("b")
+	s.OnRequest(r)
+	assertAdmitted(t, r)
+	if f.startsFor("b") != 1 {
+		t.Fatal("fresh request at 300 seconds must swap")
+	}
+}
+
+func TestFIFO_RejectSwapCollisionAndJoin(t *testing.T) {
+	f := newFakeEffects()
+	f.states["a"] = process.StateStopped
+	f.states["b"] = process.StateStopped
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"b": {"a"}}}, config.FifoConfig{BusyPolicy: "reject", IdleTimeout: 10}, nil, f)
+	s.OnRequest(req("a"))
+	join := req("a")
+	s.OnRequest(join)
+	assertAdmitted(t, join)
+	other := req("b")
+	s.OnRequest(other)
+	if err := admitErr(t, other); err == nil {
+		t.Fatal("colliding swap must reject")
+	}
+	if len(s.active["a"].waiters) != 2 || len(s.queued) != 0 {
+		t.Fatal("same-target callers should join; collisions must not queue")
+	}
+	// A successful load with no remaining callers still has a quiet period.
+	s.OnCancel(s.active["a"].waiters[0])
+	now := time.Unix(2000, 0)
+	s.now = func() time.Time { return now }
+	s.OnSwapDone(f.swapDone("a", nil))
+	if !s.evictionProtected([]string{"a"}) {
+		t.Fatal("successful load should be protected")
+	}
+	now = now.Add(10 * time.Second)
+	if s.evictionProtected([]string{"a"}) {
+		t.Fatal("custom quiet period should expire at boundary")
+	}
+}

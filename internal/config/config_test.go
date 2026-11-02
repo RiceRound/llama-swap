@@ -2023,3 +2023,30 @@ routing:
 	require.NoError(t, err)
 	assert.Equal(t, 5, cfg.Routing.Scheduler.Settings.Fifo.Priority["gemma"])
 }
+
+func TestConfig_Routing_FifoBusyPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, settings string
+		valid          bool
+	}{
+		{"reject", "busyPolicy: reject\n        idleTimeout: 300", true},
+		{"queue", "busyPolicy: queue", true},
+		{"zero", "busyPolicy: reject\n        idleTimeout: 0", true},
+		{"bad-policy", "busyPolicy: discard", false},
+		{"negative-timeout", "idleTimeout: -1", false},
+		{"overflow", "idleTimeout: 9223372037", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			yml := twoModels + "\nrouting:\n  scheduler:\n    settings:\n      fifo:\n        " + tc.settings + "\n"
+			cfg, err := LoadConfigFromReader(strings.NewReader(yml))
+			if tc.valid {
+				require.NoError(t, err)
+				if tc.name == "reject" {
+					assert.Equal(t, 300, cfg.Routing.Scheduler.Settings.Fifo.IdleTimeout)
+				}
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}

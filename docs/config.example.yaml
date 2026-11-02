@@ -867,6 +867,11 @@ routing:
     use: fifo
     settings:
       fifo:
+        # queue (default), or reject conflicting swaps with HTTP 503.
+        busyPolicy: queue
+        # In reject mode, protect a model for this many seconds after its
+        # last request finishes. 0 uses 300. This is not an unload timer.
+        idleTimeout: 300
         # priority: a dictionary of model ID -> priority
         # - optional, default: empty dictionary
         # - models default to priority 0

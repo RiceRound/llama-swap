@@ -281,6 +281,13 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	if config.Routing.Scheduler.Use != "fifo" {
 		return Config{}, fmt.Errorf("routing.scheduler.use: unknown scheduler %q (valid: fifo)", config.Routing.Scheduler.Use)
 	}
+	fifo := config.Routing.Scheduler.Settings.Fifo
+	if fifo.BusyPolicy != "" && fifo.BusyPolicy != "queue" && fifo.BusyPolicy != "reject" {
+		return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.busyPolicy: must be queue or reject")
+	}
+	if fifo.IdleTimeout < 0 || int64(fifo.IdleTimeout) > 9223372036 {
+		return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.idleTimeout: must be between 0 and 9223372036 seconds")
+	}
 	for modelID := range config.Routing.Scheduler.Settings.Fifo.Priority {
 		if _, found := config.RealModelName(modelID); !found {
 			return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.priority references unknown model %q", modelID)

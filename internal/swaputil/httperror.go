@@ -150,3 +150,16 @@ func (e ConcurrencyLimitError) message() string {
 	}
 	return "Too many requests"
 }
+
+// ModelBusyError tells polling clients to submit a new request later. The
+// retry interval is a hint, not a promise: current work may extend protection.
+type ModelBusyError struct{}
+
+func (ModelBusyError) Error() string   { return "model busy; retry later" }
+func (ModelBusyError) StatusCode() int { return http.StatusServiceUnavailable }
+func (ModelBusyError) Header() http.Header {
+	return http.Header{"Content-Type": {"application/json"}, "Retry-After": {"5"}}
+}
+func (e ModelBusyError) Body() []byte {
+	return NewErrorEnvelope(e.StatusCode(), e.Error(), "model_busy").JSON()
+}

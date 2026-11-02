@@ -936,3 +936,26 @@ func TestBaseRouter_SetsLocalHint(t *testing.T) {
 		t.Errorf("hint = %+v, want local vllm", *h)
 	}
 }
+
+func TestBaseRouter_RejectBusyBeforeLoadingStream(t *testing.T) {
+	sendLoading := true
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		Models:             map[string]config.ModelConfig{"a": {SendLoadingState: &sendLoading}, "b": {}},
+		Routing:            config.RoutingConfig{Scheduler: config.SchedulerConfig{Settings: config.SchedulerSettings{Fifo: config.FifoConfig{BusyPolicy: "reject"}}}},
+	}
+	a, bp := newFakeProcess("a"), newFakeProcess("b")
+	a.autoReady, bp.autoReady = true, true
+	b := newTestBaseWithConfig(t, conf, map[string]process.Process{"a": a, "b": bp}, &stubPlanner{evict: map[string][]string{"a": {"b"}}})
+	b.ServeHTTP(httptest.NewRecorder(), newStreamRequest("b"))
+	waitProcessed(t, b.testProcessed, 2) // request and swap done; serve done is not signalled
+	w := httptest.NewRecorder()
+	b.ServeHTTP(w, newStreamRequest("a"))
+	if w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") != "5" {
+		t.Fatalf("want 503 with retry hint, got %d %v %s", w.Code, w.Header(), w.Body.String())
+	}
+	var envelope swaputil.ErrorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil || envelope.Error.Code != "model_busy" {
+		t.Fatalf("want model_busy JSON without loading stream, got %s (%v)", w.Body.String(), err)
+	}
+}

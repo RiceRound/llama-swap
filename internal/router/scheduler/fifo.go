@@ -33,7 +33,8 @@ type activeSwap struct {
 //
 // A B C A B C --> A A B B C C
 //
-// The strategy is simple and reduces the number of swaps required.
+// With busyPolicy reject, conflicting swaps are rejected before admission
+// and resident models are protected through their configured quiet period.
 type FIFO struct {
 	name    string
 	logger  *logmon.Monitor
@@ -46,6 +47,9 @@ type FIFO struct {
 	reserved map[string]int
 	inFlight map[string]int
 	queued   []HandlerReq
+
+	idleSince map[string]time.Time
+	now       func() time.Time
 
 	nextGeneration uint64
 }
@@ -64,15 +68,17 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 	}
 
 	return &FIFO{
-		name:     name,
-		logger:   logger,
-		planner:  planner,
-		cfg:      cfg,
-		effects:  eff,
-		limits:   limits,
-		active:   make(map[string]*activeSwap),
-		reserved: make(map[string]int),
-		inFlight: make(map[string]int),
+		name:      name,
+		logger:    logger,
+		planner:   planner,
+		cfg:       cfg,
+		effects:   eff,
+		limits:    limits,
+		active:    make(map[string]*activeSwap),
+		reserved:  make(map[string]int),
+		inFlight:  make(map[string]int),
+		idleSince: make(map[string]time.Time),
+		now:       time.Now,
 	}
 }
 
@@ -81,7 +87,8 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 // siblings, waiting for ready) is deferred to a swap goroutine and reported back
 // via OnSwapDone.
 //
-// The decision tree, in order:
+// In reject mode, conflicting or protected evictions return 503 before
+// admission. Otherwise the decision tree, in order:
 //
 //  1. Unknown model — respond with ErrModelNotFound and move on.
 //  2. A swap to the same model is already in flight — attach this waiter so
@@ -102,6 +109,18 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		s.logger.Debugf("%s: model %s not handled by this router", s.name, req.Model)
 		s.rejectAdmission(req, ErrModelNotFound)
 		return
+	}
+
+	// Reject before admission: a loading stream may commit HTTP 200 as soon
+	// as admission succeeds. Never reserve or enqueue a rejected request.
+	if s.cfg.BusyPolicy == "reject" {
+		if _, joining := s.active[req.Model]; !joining {
+			evict := s.planner.EvictionFor(req.Model, s.runningSet(req.Model))
+			if collidesWith(req.Model, evict, s.active) || s.evictionProtected(evict) {
+				s.rejectAdmission(req, swaputil.ModelBusyError{})
+				return
+			}
+		}
 	}
 
 	if !s.admit(req) {
@@ -197,6 +216,9 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 	}
 	sw.cancel()
 	delete(s.active, ev.ModelID)
+	if ev.Err == nil {
+		s.idleSince[ev.ModelID] = s.now()
+	}
 
 	for _, w := range sw.waiters {
 		if ev.Err != nil {
@@ -210,14 +232,17 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 }
 
 // OnServeDone decrements the per-model in-flight count and, when that drops to
-// zero, retries the queue: requests whose swap was deferred because they would
-// have evicted this (now-idle) process can now proceed.
+// zero, starts the quiet period. Queue mode also retries deferred swaps;
+// reject mode waits for a fresh client request after the quiet period.
 func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	s.inFlight[ev.ModelID]--
 	s.release(ev.ModelID)
 	if s.inFlight[ev.ModelID] <= 0 {
 		delete(s.inFlight, ev.ModelID)
-		s.drainQueue()
+		s.idleSince[ev.ModelID] = s.now()
+		if s.cfg.BusyPolicy != "reject" {
+			s.drainQueue()
+		}
 	}
 }
 
@@ -265,6 +290,9 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	// intentionally NOT cleared here: each dying handler will fire its tracked
 	// serve and reach OnServeDone in the normal way.
 	s.effects.StopProcesses(timeout, targets)
+	for _, id := range targets {
+		delete(s.idleSince, id)
+	}
 
 	// Removing entries from active above may have unblocked queued requests
 	// that previously collided with the now-cancelled swaps.
@@ -296,6 +324,7 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 
 	if s.effects.GrantServe(req, modelID) {
 		s.inFlight[modelID]++
+		delete(s.idleSince, modelID)
 	} else {
 		s.release(modelID)
 	}
@@ -447,6 +476,26 @@ func (s *FIFO) drainQueue() {
 	}
 	s.queued = remaining
 	broadcastQueuePositions(s.queued)
+}
+
+// evictionProtected is evaluated on the router run loop, just like inFlight.
+// An active request stays protected regardless of its duration. The quiet
+// period begins only when the last handler returns, and a new handler resets it.
+func (s *FIFO) evictionProtected(evict []string) bool {
+	if conflictsWithInFlight(evict, s.inFlight) {
+		return true
+	}
+	timeout := time.Duration(s.cfg.IdleTimeout) * time.Second
+	if timeout == 0 {
+		timeout = 5 * time.Minute
+	}
+	now := s.now()
+	for _, id := range evict {
+		if since, ok := s.idleSince[id]; ok && now.Sub(since) < timeout {
+			return true
+		}
+	}
+	return false
 }
 
 // runningSet is the live model set handed to the Swapper: every process the

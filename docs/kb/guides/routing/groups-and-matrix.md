@@ -3,7 +3,7 @@ title: Running several models at once with groups, matrix and capacity
 summary: Choosing between group, matrix and capacity routers, and how each decides what gets unloaded.
 category: guides
 tags: [routing, groups, matrix, capacity, concurrency, swap, vram, memory]
-config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.capacity.pools, models.*.capacities, models.*.evict_cost]
+config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.capacity.pools, models.*.capacities, models.*.evict_cost, routing.scheduler.settings.fifo.busyPolicy, routing.scheduler.settings.fifo.idleTimeout]
 updated: 2026-10-22
 ---
 
@@ -278,6 +278,45 @@ routing:
 ```
 
 Higher numbers are serviced first. Models default to 0.
+
+## Poll instead of queueing swaps
+
+```yaml
+globalTTL: 0
+routing:
+  scheduler:
+    settings:
+      fifo:
+        busyPolicy: reject
+        idleTimeout: 300
+```
+
+`busyPolicy: queue` preserves the default behavior. With `reject`, a request
+that would evict a model handling requests or within its quiet period receives
+HTTP 503, JSON error code `model_busy`, and `Retry-After: 5`. Collisions with
+ongoing swaps also return 503. No request is retained for automatic retry:
+clients must submit a fresh request, ideally with jitter after Retry-After.
+Requests for the loaded model continue normally, subject to concurrency limits
+(HTTP 429); requests for a model already loading join that load.
+
+The quiet period starts when the **last HTTP handler finishes**, including
+streaming responses. Each new served request resets it. Zero `idleTimeout`
+uses 300 seconds; negative values are invalid. At the boundary a fresh request
+can swap models; there is no timer that starts a swap automatically. Models
+without a recorded request or successful load have no quiet-period protection.
+This applies to eviction decisions from group, matrix and capacity routers.
+
+Use `globalTTL: 0` and model `ttl: 0` (or inherit globalTTL) to avoid a separate
+TTL unloading a model earlier. Explicit unload and shutdown still override the
+quiet period. Priority ordering has no effect on rejected requests.
+
+ComfyUI submits asynchronous work: its HTTP submit response can finish before
+the GPU job, and its ignored websocket is outside scheduler tracking. This
+quiet period alone cannot guarantee protection for a ComfyUI job lasting more
+than 300 seconds. Until a job-status integration is added, isolate ComfyUI in
+its own resource group or keep other clients from requesting conflicting
+models during generation. Polling ComfyUI through tracked HTTP routes may
+also keep resetting its quiet period even when no GPU job is running.
 
 ## Related
 

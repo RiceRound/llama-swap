@@ -1001,6 +1001,19 @@
                                 "fifo": {
                                     "type": "object",
                                     "properties": {
+                                        "busyPolicy": {
+                                            "type": "string",
+                                            "enum": ["queue", "reject"],
+                                            "default": "queue",
+                                            "description": "Reject conflicting swaps with HTTP 503 instead of queueing; keep serving resident models."
+                                        },
+                                        "idleTimeout": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9223372036,
+                                            "default": 300,
+                                            "description": "Quiet period in seconds after the last handler finishes before reject allows eviction. Zero uses 300. Does not automatically unload models."
+                                        },
                                         "priority": {
                                             "type": "object",
                                             "description": "Per-model priority. Keys are model IDs, values are integers (default 0). Higher values are serviced first.",

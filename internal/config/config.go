@@ -319,7 +319,13 @@ type SchedulerSettings struct {
 }
 
 type FifoConfig struct {
-	Priority map[string]int `yaml:"priority"` // model ID -> priority, default 0
+	// BusyPolicy is queue (default) or reject. Reject sheds conflicting swaps
+	// before admission so HTTP clients can poll without holding a queued request.
+	BusyPolicy string `yaml:"busyPolicy"`
+	// IdleTimeout is the quiet period in seconds before reject allows eviction.
+	// Zero uses 300 seconds. It does not automatically unload a model.
+	IdleTimeout int            `yaml:"idleTimeout"`
+	Priority    map[string]int `yaml:"priority"` // model ID -> priority, default 0
 }
 
 type RouterConfig struct {
